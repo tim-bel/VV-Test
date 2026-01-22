@@ -37,7 +37,9 @@ tts = [
   "av",
   "aiortc",
   "uvicorn[standard]",
-  "fastapi"
+  "fastapi",
+  "PySide6",
+  "soundfile"
 ]
 
 asr = [
