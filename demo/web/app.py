@@ -123,6 +123,11 @@ class StreamingTTSService:
         self.default_voice_key = self._determine_voice_key(preset_name)
         self._ensure_voice_cached(self.default_voice_key)
 
+    def reload_voices(self) -> None:
+        """Reloads the voice presets from disk."""
+        print("[StreamingTTSService] Reloading voices from disk...")
+        self.voice_presets = self._load_voice_presets()
+
     def _load_voice_presets(self) -> Dict[str, Path]:
         voices_dir = BASE.parent / "voices" / "streaming_model"
         if not voices_dir.exists():

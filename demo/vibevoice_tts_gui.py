@@ -6,6 +6,9 @@ import traceback
 import tempfile
 import numpy as np
 import soundfile as sf
+import urllib.request
+import tarfile
+import shutil
 from pathlib import Path
 from typing import Optional, Dict
 
@@ -14,7 +17,8 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QFormLayout, QLabel, QLineEdit, QCheckBox, QSpinBox,
     QDoubleSpinBox, QPushButton, QTextEdit, QComboBox,
-    QFileDialog, QMessageBox, QProgressBar, QGroupBox, QSplitter
+    QFileDialog, QMessageBox, QProgressBar, QGroupBox, QSplitter,
+    QDialog, QListWidget, QListWidgetItem, QAbstractItemView
 )
 from PySide6.QtCore import QThread, Signal, Qt, QUrl
 from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
@@ -37,6 +41,196 @@ except ImportError as e:
     # where the project structure is intact.
     raise ImportError(f"Could not import StreamingTTSService. Ensure you are in the project root or dependencies are installed. Error: {e}")
 
+AVAILABLE_VOICE_PACKS = [
+    {"name": "German Voices", "file": "experimental_voices_de.tar.gz", "url": "https://github.com/user-attachments/files/24035887/experimental_voices_de.tar.gz"},
+    {"name": "French Voices", "file": "experimental_voices_fr.tar.gz", "url": "https://github.com/user-attachments/files/24035880/experimental_voices_fr.tar.gz"},
+    {"name": "Japanese Voices", "file": "experimental_voices_jp.tar.gz", "url": "https://github.com/user-attachments/files/24035882/experimental_voices_jp.tar.gz"},
+    {"name": "Korean Voices", "file": "experimental_voices_kr.tar.gz", "url": "https://github.com/user-attachments/files/24035883/experimental_voices_kr.tar.gz"},
+    {"name": "Polish Voices", "file": "experimental_voices_pl.tar.gz", "url": "https://github.com/user-attachments/files/24035885/experimental_voices_pl.tar.gz"},
+    {"name": "Portuguese Voices", "file": "experimental_voices_pt.tar.gz", "url": "https://github.com/user-attachments/files/24035886/experimental_voices_pt.tar.gz"},
+    {"name": "Spanish Voices", "file": "experimental_voices_sp.tar.gz", "url": "https://github.com/user-attachments/files/24035884/experimental_voices_sp.tar.gz"},
+    {"name": "English Voices 1", "file": "experimental_voices_en1.tar.gz", "url": "https://github.com/user-attachments/files/24189272/experimental_voices_en1.tar.gz"},
+    {"name": "English Voices 2", "file": "experimental_voices_en2.tar.gz", "url": "https://github.com/user-attachments/files/24189273/experimental_voices_en2.tar.gz"},
+]
+
+class VoiceDownloadWorker(QThread):
+    progress = Signal(float)  # Percentage
+    log = Signal(str)
+    finished = Signal()
+    error = Signal(str)
+
+    def __init__(self, voice_pack, target_dir):
+        super().__init__()
+        self.voice_pack = voice_pack
+        self.target_dir = target_dir
+        self._is_running = True
+
+    def run(self):
+        try:
+            url = self.voice_pack["url"]
+            filename = self.voice_pack["file"]
+            filepath = os.path.join(self.target_dir, filename)
+
+            # Ensure target directory exists
+            os.makedirs(self.target_dir, exist_ok=True)
+
+            self.log.emit(f"Downloading {filename}...")
+
+            def report_hook(block_num, block_size, total_size):
+                if not self._is_running:
+                    raise InterruptedError("Download cancelled")
+                if total_size > 0:
+                    percent = (block_num * block_size * 100) / total_size
+                    self.progress.emit(percent)
+
+            if not os.path.exists(filepath):
+                 urllib.request.urlretrieve(url, filepath, report_hook)
+            else:
+                 self.log.emit(f"{filename} already exists, skipping download.")
+
+            self.log.emit(f"Extracting {filename}...")
+            self.progress.emit(0) # Reset progress for extraction (indeterminate mostly)
+
+            with tarfile.open(filepath, "r:gz") as tar:
+                # tar.extractall(path=self.target_dir) # This can be slow and blocking without progress
+                # Iterate members to show some activity
+                members = tar.getmembers()
+                total_members = len(members)
+                for i, member in enumerate(members):
+                     if not self._is_running:
+                         break
+                     tar.extract(member, path=self.target_dir)
+                     if total_members > 0:
+                         self.progress.emit((i / total_members) * 100)
+
+            # Clean up tar file
+            if os.path.exists(filepath):
+                os.remove(filepath)
+
+            self.log.emit("Done.")
+            self.finished.emit()
+
+        except Exception as e:
+            traceback.print_exc()
+            self.error.emit(str(e))
+
+    def stop(self):
+        self._is_running = False
+
+class VoiceDownloaderDialog(QDialog):
+    voices_downloaded = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Download Experimental Voices")
+        self.resize(600, 400)
+
+        layout = QVBoxLayout(self)
+
+        # Search/Filter
+        filter_layout = QHBoxLayout()
+        filter_layout.addWidget(QLabel("Search:"))
+        self.search_input = QLineEdit()
+        self.search_input.setPlaceholderText("Filter voices...")
+        self.search_input.textChanged.connect(self.filter_voices)
+        filter_layout.addWidget(self.search_input)
+        layout.addLayout(filter_layout)
+
+        # List of voices
+        self.voice_list = QListWidget()
+        self.voice_list.setSelectionMode(QAbstractItemView.SingleSelection)
+        layout.addWidget(self.voice_list)
+
+        self.populate_list()
+
+        # Progress
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setValue(0)
+        self.progress_bar.hide()
+        layout.addWidget(self.progress_bar)
+
+        self.status_label = QLabel("")
+        layout.addWidget(self.status_label)
+
+        # Buttons
+        btn_layout = QHBoxLayout()
+        self.download_btn = QPushButton("Download Selected")
+        self.download_btn.clicked.connect(self.download_selected)
+        btn_layout.addWidget(self.download_btn)
+
+        self.close_btn = QPushButton("Close")
+        self.close_btn.clicked.connect(self.accept)
+        btn_layout.addWidget(self.close_btn)
+
+        layout.addLayout(btn_layout)
+
+        self.worker = None
+
+    def populate_list(self):
+        self.voice_list.clear()
+        for pack in AVAILABLE_VOICE_PACKS:
+            item = QListWidgetItem(pack["name"])
+            item.setData(Qt.UserRole, pack)
+            self.voice_list.addItem(item)
+
+    def filter_voices(self, text):
+        for i in range(self.voice_list.count()):
+            item = self.voice_list.item(i)
+            pack = item.data(Qt.UserRole)
+            if text.lower() in pack["name"].lower():
+                item.setHidden(False)
+            else:
+                item.setHidden(True)
+
+    def download_selected(self):
+        items = self.voice_list.selectedItems()
+        if not items:
+            QMessageBox.warning(self, "Warning", "Please select a voice pack to download.")
+            return
+
+        item = items[0]
+        pack = item.data(Qt.UserRole)
+
+        target_dir = str(project_root / "demo" / "voices" / "streaming_model" / "experimental_voices")
+
+        self.download_btn.setEnabled(False)
+        self.close_btn.setEnabled(False)
+        self.voice_list.setEnabled(False)
+        self.progress_bar.show()
+        self.progress_bar.setValue(0)
+        self.status_label.setText(f"Starting download of {pack['name']}...")
+
+        self.worker = VoiceDownloadWorker(pack, target_dir)
+        self.worker.progress.connect(self.progress_bar.setValue)
+        self.worker.log.connect(self.status_label.setText)
+        self.worker.finished.connect(self.on_download_finished)
+        self.worker.error.connect(self.on_download_error)
+        self.worker.start()
+
+    def on_download_finished(self):
+        self.status_label.setText("Download completed successfully!")
+        self.download_btn.setEnabled(True)
+        self.close_btn.setEnabled(True)
+        self.voice_list.setEnabled(True)
+        self.progress_bar.hide()
+        self.worker = None
+        self.voices_downloaded.emit()
+        QMessageBox.information(self, "Success", "Voice pack installed!")
+
+    def on_download_error(self, error):
+        self.status_label.setText(f"Error: {error}")
+        self.download_btn.setEnabled(True)
+        self.close_btn.setEnabled(True)
+        self.voice_list.setEnabled(True)
+        self.progress_bar.hide()
+        self.worker = None
+        QMessageBox.critical(self, "Error", f"Download failed:\n{error}")
+
+    def closeEvent(self, event):
+        if self.worker and self.worker.isRunning():
+            self.worker.stop()
+            self.worker.wait()
+        event.accept()
 
 class TTSWorker(QThread):
     """
@@ -214,9 +408,17 @@ class VibeVoiceTTSWindow(QMainWindow):
         params_form = QFormLayout()
 
         # Voice
+        voice_layout = QHBoxLayout()
         self.voice_combo = QComboBox()
         self.voice_combo.setToolTip("Select the voice persona.")
-        params_form.addRow("Voice:", self.voice_combo)
+        voice_layout.addWidget(self.voice_combo, 1)
+
+        self.download_voices_btn = QPushButton("Download Voices")
+        self.download_voices_btn.setToolTip("Search and download experimental voices.")
+        self.download_voices_btn.clicked.connect(self.open_voice_downloader)
+        voice_layout.addWidget(self.download_voices_btn)
+
+        params_form.addRow("Voice:", voice_layout)
 
         # CFG Scale
         self.cfg_spin = QDoubleSpinBox()
@@ -309,6 +511,31 @@ class VibeVoiceTTSWindow(QMainWindow):
     def toggle_sampling_params(self, checked):
         self.temp_spin.setEnabled(checked)
         self.top_p_spin.setEnabled(checked)
+
+    def open_voice_downloader(self):
+        dialog = VoiceDownloaderDialog(self)
+        dialog.voices_downloaded.connect(self.refresh_voices)
+        dialog.exec()
+
+    def refresh_voices(self):
+        if self.service:
+            try:
+                self.service.reload_voices()
+                current_voice = self.voice_combo.currentText()
+                self.voice_combo.clear()
+                if self.service.voice_presets:
+                    voices = sorted(self.service.voice_presets.keys())
+                    self.voice_combo.addItems(voices)
+
+                    if current_voice in voices:
+                         index = self.voice_combo.findText(current_voice)
+                         self.voice_combo.setCurrentIndex(index)
+                    elif self.service.default_voice_key:
+                        index = self.voice_combo.findText(self.service.default_voice_key)
+                        if index >= 0: self.voice_combo.setCurrentIndex(index)
+                QMessageBox.information(self, "Voices Reloaded", "Voice list has been updated.")
+            except Exception as e:
+                QMessageBox.warning(self, "Error", f"Failed to reload voices: {e}")
 
     def load_model(self):
         path = self.path_input.text().strip()
@@ -419,7 +646,6 @@ class VibeVoiceTTSWindow(QMainWindow):
         )
         if file_path:
             try:
-                import shutil
                 shutil.copy2(self.temp_audio_path, file_path)
                 QMessageBox.information(self, "Success", f"Saved to {file_path}")
             except Exception as e:
